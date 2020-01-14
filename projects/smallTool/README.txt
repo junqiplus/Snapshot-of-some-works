@@ -1,7 +1,7 @@
 /*Dong Junqi  2020.1.14  ,  This small program was developed in 2018.12.25 when I was tooking Data Structure*/
 Text helper could go through any text file, and count any keyword you want.
 
-usage£º
+usage:
 1. Click on right most button on top of the main board and a dialog will appear asking for path to your text file.
 2. Input the path and click on the left button on the dialog.
 3. The text file will appear on the main board with line number atomatically appeared along the left side.
