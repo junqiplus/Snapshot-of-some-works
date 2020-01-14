@@ -1,0 +1,175 @@
+/////////BEFORE MY IMPROVEMENT
+
+
+void conv_forward(conv_layer_t* l, volume_t** inputs, volume_t** outputs, int start, int end) {
+  for (int i = start; i <= end; i++) {
+    volume_t* in  = inputs[i];
+    volume_t* out = outputs[i];
+
+    int stride = l->stride;
+
+    for (int f = 0; f < l->output_depth; f++) {
+      volume_t* filter = l->filters[f];
+      int y = -l->pad;
+      for (int out_y = 0; out_y < l->output_height; y += stride, out_y++) {
+        int x = -l->pad;
+        for (int out_x = 0; out_x < l->output_width; x += stride, out_x++) {
+
+          // Take sum of element-wise product
+          double sum = 0.0;
+          for (int fy = 0; fy < filter->height; fy++) {
+            int in_y = y + fy;
+            for (int fx = 0; fx < filter->width; fx++) {
+              int in_x = x + fx;
+              if (in_y >= 0 && in_y < in->height && in_x >= 0 && in_x < in->width) {
+                for (int fd = 0; fd < filter->depth; fd++) {
+                  sum += volume_get(filter, fx, fy, fd) * volume_get(in, in_x, in_y, fd);
+                }
+              }
+            }
+          }
+
+          sum += l->biases->weights[f];
+          volume_set(out, out_x, out_y, f, sum);
+        }
+      }
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+///////AFTER MY IMPROVEMENT
+
+
+void conv_forward(conv_layer_t* l, volume_t** inputs, volume_t** outputs, int start, int end) {
+  for (int i = start; i <= end; i++) {
+    volume_t* in  = inputs[i];
+    volume_t* out = outputs[i];
+	volume_t** myFilters = makeMyFilter(l);  //rearrange the sequence of filters to increase cache hit rate
+    int stride = l->stride;
+
+	//avoid to use volume_get cause multiplication cost more than add instruction
+	int* in_y_array, * in_x_array, * out_y_array, * out_x_array, * fy_array, * fx_array;
+	in_y_array = (int*)malloc(sizeof(int) * in->height);
+	in_x_array = (int*)malloc(sizeof(int) * in->width);
+	out_y_array = (int*)malloc(sizeof(int) * out->height);
+	out_x_array = (int*)malloc(sizeof(int) * out->width);
+	fy_array = (int*)malloc(sizeof(int) * l->filter_height);
+	fx_array = (int*)malloc(sizeof(int) * l->filter_width);
+	for (int i = 0, n = in->width * in->depth; i < in->height; ++i)
+	{
+		in_y_array[i] = i * n;
+	}
+	for (int i = 0, n = in->depth; i < in->width; ++i)
+	{
+		in_x_array[i] = i * n;
+	}
+	for (int i = 0, n = out->width * out->depth; i < out->height; ++i)
+	{
+		out_y_array[i] = i * n;
+	}
+	for (int i = 0, n = out->depth; i < out->width; ++i)
+	{
+		out_x_array[i] = i * n;
+	}
+	for (int i = 0, n = l->filter_width * l->input_depth; i < l->filter_height; ++i)
+	{
+		fy_array[i] = i * n;
+	}
+	for (int i = 0, n = l->input_depth; i < l->filter_width; ++i)
+	{
+		fx_array[i] = i * n;
+	}
+//    for (int out_y = 0,y = -l->pad; out_y < l->output_height; y += stride, ++out_y) {
+//	  for (int f4 = 4; f4 <= l->output_depth; f4+=4) {
+	for (int out_x = 0,x = -l->pad; out_x < l->output_width; x += stride, ++out_x) {
+	  for (int filters = 0; filters < l->output_depth<<2; ++filters) {
+		for (int out_y = 0,y = -l->pad; out_y < l->output_height; y += stride, ++out_y) {
+			/*volume_t* filter0 = l->filters[f4 - 4],
+				*filter1 = l->filters[f4 - 3],
+				*filter2 = l->filters[f4 - 2],
+				*filter3 = l->filters[f4 - 1];
+			*/
+			volume_t* filter0_4 = myFilters[filters];
+			__m256d sum_256d = _mm256_setzero_pd();
+          
+			// Take sum of element-wise product
+
+			int in_y = y > 0 ? y : 0,
+				fy = y<0 ? -y : 0,
+				fylim = y>(in->height - l->filter_height) ? in->height - y : l->filter_height;
+			for (; fy < fylim; ++in_y, ++fy) {
+				int in_x = x > 0 ? x : 0,
+					fx = x<0 ? -x : 0,
+					fxlim = x>(in->width - l->filter_width) ? in->width - x : l->filter_width;
+				for (; fx < fxlim; ++in_x, ++fx) {
+					for (int fd = 0,filter_weight_xyd=fx_array[fx] + fy_array[fy],in_weight_xyd=in_x_array[in_x]+in_y_array[in_y]; fd < l->input_depth;++in_weight_xyd, ++filter_weight_xyd,++fd) {
+						sum_256d = _mm256_fmadd_pd(_mm256_loadu_pd(filter0_4->weights+filter_weight_xyd<<2), _mm256_set1_pd(in->weights[in_weight_xyd]), sum_256d);
+					}
+				}
+			}
+//_mm256_setr_pd(filter0->weights[filter_weight_xyd], filter1->weights[filter_weight_xyd], filter2->weights[filter_weight_xyd], filter3->weights[filter_weight_xyd])
+			_mm256_storeu_pd(out->weights + out_x_array[out_x] + out_y_array[out_y] + filters << 2, _mm256_add_pd(sum_256d, _mm256_loadu_pd(l->biases->weights + filters << 2)));
+		}
+	  }
+	}
+	//tail case
+	for (int f = ((l->output_depth)>>2)<<2; f < l->output_depth; ++f) {
+		volume_t* filter = l->filters[f];
+		for (int out_y = 0,y = -l->pad; out_y < l->output_height; y += stride, ++out_y) {
+			for (int out_x = 0,x = -l->pad; out_x < l->output_width; x += stride, ++out_x) {
+
+				// Take sum of element-wise product
+				double sum = 0.0;
+				for (int fy = 0; fy < filter->height; ++fy) {
+					int in_y = y + fy;
+					for (int fx = 0; fx < filter->width; ++fx) {
+						int in_x = x + fx;
+						if (in_y >= 0 && in_y < in->height && in_x >= 0 && in_x < in->width) {
+							for (int fd = 0; fd < filter->depth; ++fd) {
+								sum += volume_get(filter, fx, fy, fd) * volume_get(in, in_x, in_y, fd);
+							}
+						}
+					}
+				}
+
+				sum += l->biases->weights[f];
+				volume_set(out, out_x, out_y, f, sum);
+			}
+		}
+	}
+	free(in_x_array);
+	free(in_y_array);
+	free(out_x_array);
+	free(out_y_array);
+	free(fx_array);
+	free(fy_array);
+	freeMyFilter(myFilters);
+  }
+}
+
+
+
+
+///////volume_get and volume_set are not possible to speed up by themselves.
+
+inline double volume_get(volume_t* v, int x, int y, int d) {
+  return v->weights[((v->width * y) + x) * v->depth + d];
+}
+
+inline void volume_set(volume_t* v, int x, int y, int d, double value) {
+  v->weights[((v->width * y) + x) * v->depth + d] = value;
+}
+
+
+
+
